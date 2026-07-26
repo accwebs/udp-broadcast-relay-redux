@@ -1,14 +1,14 @@
 #!/bin/sh
 
 # REQUIRE: NETWORKING
-# PROVIDE: udp-broadcast-relay
+# PROVIDE: udp_broadcast_relay
 
 # start/stop script for the github udp-redux/udp-broadcast-relay-redux
 
 . /etc/rc.subr
 
 # note that rcvar is in the /etc/rc.conf.local file to enable/disable the bouncer
-name="udp-broadcast-relay"
+name="udp_broadcast_relay"
 rcvar="udp_broadcast_relay_enable"
 start_cmd="udp_broadcast_relay_start"
 stop_cmd="udp_broadcast_relay_stop"
