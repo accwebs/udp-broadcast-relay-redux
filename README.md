@@ -1,9 +1,11 @@
-ARCHIVED
+Project/Fork Status
 ===
 
-This package still works perfectly fine to the best of my knowledge as of 2024, however I do not use it anymore personally and
-do not have time to follow issues / accept PRs. Feel free to fork as you see fit, following the license restrictions
-provided by this repo and the upstream.
+This is a fork of the now-archived
+[udp-redux/udp-broadcast-relay-redux](https://github.com/udp-redux/udp-broadcast-relay-redux) project with an aim to 
+keep it alive so it can be retained in [OpenWrt](https://github.com/openwrt/packages). If someone identifies a "better"
+fork to point at, please contact accwebs. For now, I'm keeping it minimally maintained here. I will happily review
+minor PRs, etc.
 
 UDP Broadcast Relay for Linux / FreeBSD / pfSense
 ==========================
