@@ -125,7 +125,7 @@ Then rename your second instance variables:
 
 ```shell
 # nano udp-broadcast-relay.sh
-# name="udp-broadcast-relay2"
+# name="udp_broadcast_relay2"
 # rcvar="udp_broadcast_relay2_enable"
 ...
 conf_file="/usr/local/etc/udp-broadcast-relay-redux2.conf"

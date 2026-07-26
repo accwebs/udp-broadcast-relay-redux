@@ -1,7 +1,7 @@
 #!/bin/sh
 
 # REQUIRE: NETWORKING
-# PROVIDE: udp-broadcast-relay
+# PROVIDE: udp_broadcast_relay
 
 # start/stop script for the github udp-redux/udp-broadcast-relay-redux
 
