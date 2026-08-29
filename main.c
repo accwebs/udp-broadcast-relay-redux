@@ -23,6 +23,7 @@ GNU General Public License for more details.
 
 #define MAXIFS    256
 #define MAXMULTICAST 256
+#define MAXTARGETS 256
 #define DPRINT  if (debug) printf
 #define IPHEADER_LEN 20
 #define UDPHEADER_LEN 8
@@ -51,12 +52,22 @@ GNU General Public License for more details.
 
 /* list of addresses and interface numbers on local machine */
 struct Iface {
+    char* name;
     struct in_addr dstaddr;
     struct in_addr ifaddr;
     int ifindex;
     int raw_socket;
 };
 static struct Iface ifs[MAXIFS];
+
+/* A parsed -t entry: either global (ifaceName == NULL) or scoped to one
+ * --dev interface name. */
+struct TargetOverride {
+    const char* ifaceName;
+    struct in_addr addr;
+};
+static struct TargetOverride targetOverrides[MAXTARGETS];
+static size_t targetOverridesNum = 0;
 
 /* Where we forge our packets */
 static u_char gram[4096]=
@@ -76,6 +87,98 @@ void inet_ntoa2(struct in_addr in, char* chr, int len) {
     strncpy(chr, from, len);
 }
 
+/* Parses the -t cli argument */
+struct TargetOverride parse_target_override(const char* const argValue) {
+    // Optional "iface:" prefix, split on the first ':'.
+    // Codebase is IPv4-only, so no address contains a colon.
+    struct TargetOverride result;
+    char* ifaceName = NULL;
+    const char* addressStr = argValue;
+    const char* colon = strchr(argValue, ':');
+    if (colon != NULL) {
+        size_t ifaceLen = colon - argValue;
+        ifaceName = malloc(ifaceLen + 1);
+        if (ifaceName == NULL) {
+            perror("malloc");
+            exit(1);
+        }
+        memcpy(ifaceName, argValue, ifaceLen);
+        ifaceName[ifaceLen] = '\0';
+        addressStr = colon + 1;
+    }
+    struct in_addr converted;
+    if (inet_aton(addressStr, &converted) == 0) {
+        fprintf (stderr,"invalid target IP address: %s\n", addressStr);
+        exit(1);
+    }
+    result.ifaceName = ifaceName;
+    result.addr = converted;
+    return result;
+}
+
+/* Resolve a -t override address for a specific outgoing interface.
+ * 255.255.255.255 means "this interface's broadcast/peer address"
+ * (iface->dstaddr, populated at startup); anything else is used verbatim. */
+struct in_addr resolve_target_addr_override(const struct in_addr target_addr_override,
+                                            const struct Iface* const iface) {
+    if (target_addr_override.s_addr == INADDR_BROADCAST) {
+        // rewrite to new interface broadcast addr if user specified 255.255.255.255
+        return iface->dstaddr;
+    }
+    // else use the specified value verbatim
+    return target_addr_override;
+}
+
+/* Append addr to out[*count], bounds-checked against cap. */
+void push_addr(struct in_addr* const out, size_t* const count, const size_t cap,
+              const struct in_addr addr) {
+    if (*count >= cap) {
+        perror("to_addresses_out too small");
+        exit(1);
+    }
+    out[(*count)++] = addr;
+}
+
+/* Determine target address(es) for this outgoing interface.
+ * Entries qualified to this interface's name fully replace the bare fallback
+ * (and the default resolution) for it; absent those, bare entries apply;
+ * absent those, fall through to the default resolution below, unchanged from before. */
+size_t resolve_to_addresses(const struct in_addr rcv_inaddr,
+                            const struct Iface* const from_iface,
+                            const struct Iface* const to_iface,
+                            struct in_addr* const to_addresses_out,
+                            const size_t to_addresses_out_len) {
+    size_t to_addresses_counter = 0;
+    for (size_t iOv = 0; iOv < targetOverridesNum; iOv++) {
+        if (targetOverrides[iOv].ifaceName != NULL
+            && to_iface->name != NULL
+            && strcmp(targetOverrides[iOv].ifaceName, to_iface->name) == 0) {
+            push_addr(to_addresses_out, &to_addresses_counter, to_addresses_out_len,
+                resolve_target_addr_override(targetOverrides[iOv].addr, to_iface));
+        }
+    }
+    if (to_addresses_counter == 0) {
+        for (size_t iOv = 0; iOv < targetOverridesNum; iOv++) {
+            if (targetOverrides[iOv].ifaceName == NULL) {
+                push_addr(to_addresses_out, &to_addresses_counter, to_addresses_out_len,
+                    resolve_target_addr_override(targetOverrides[iOv].addr, to_iface));
+            }
+        }
+    }
+    if (to_addresses_counter == 0) {
+        if (rcv_inaddr.s_addr == INADDR_BROADCAST
+            || rcv_inaddr.s_addr == from_iface->dstaddr.s_addr) {
+            // Received on interface broadcast address -- rewrite to new interface broadcast addr
+            push_addr(to_addresses_out, &to_addresses_counter, to_addresses_out_len, to_iface->dstaddr);
+        }
+        else {
+            // Send to whatever IP it was originally to
+            push_addr(to_addresses_out, &to_addresses_counter, to_addresses_out_len, rcv_inaddr);
+        }
+    }
+    return to_addresses_counter;
+}
+
 int main(int argc,char **argv) {
     /* Debugging, forking, other settings */
     int debug = 0, forking = 0;
@@ -86,7 +189,6 @@ int main(int argc,char **argv) {
     char* interfaceNames[MAXIFS];
     int interfaceNamesNum = 0;
     in_addr_t spoof_addr = 0;
-    in_addr_t target_addr_override = 0;
 
     /* Address broadcast packet was sent from */
     struct sockaddr_in rcv_addr;
@@ -103,7 +205,7 @@ int main(int argc,char **argv) {
     rcv_msg.msg_controllen = sizeof(pkt_infos);
 
     if(argc < 2) {
-        fprintf(stderr,"usage: %s [-d] [-f] [-s IP] [-t IP] [--id id] [--port udp-port] [--dev dev1]... [--multicast ip]...\n\n",*argv);
+        fprintf(stderr,"usage: %s [-d] [-f] [-s IP] [-t [iface:]IP]... [--id id] [--port udp-port] [--dev dev1]... [--multicast ip]...\n\n",*argv);
         fprintf(stderr,"This program listens for broadcast  packets  on the  specified UDP port\n"
             "and then forwards them to each other given interface.  Packets are sent\n"
             "such that they appear to have come from the original broadcaster, resp.\n"
@@ -121,6 +223,12 @@ int main(int argc,char **argv) {
             "            original target is used.\n"
             "            Setting to 255.255.255.255 uses the broadcast address of the\n"
             "            outgoing interface.\n"
+            "            Can be repeated. Qualify with iface:IP (e.g. -t tun0:10.0.0.2)\n"
+            "            to apply only to packets sent out that --dev interface; a\n"
+            "            qualified -t fully replaces the default/-t fallback for that\n"
+            "            interface, and multiple -t for the same interface each send a\n"
+            "            copy. An unqualified -t IP applies to any interface with no\n"
+            "            qualified entry of its own.\n"
             "\n"
         );
         exit(1);
@@ -152,14 +260,19 @@ int main(int argc,char **argv) {
             DPRINT ("Outgoing source IP set to %s\n", argv[i]);
         }
         else if (strcmp(argv[i],"-t") == 0) {
-            struct in_addr converted;
             i++;
-            if (inet_aton(argv[i], &converted) == 0) {
-                fprintf (stderr,"invalid target IP address: %s\n", argv[i]);
+            const struct TargetOverride parsed = parse_target_override(argv[i]);
+            if (targetOverridesNum >= MAXTARGETS) {
+                fprintf (stderr,"too many -t targets (max %i)\n", MAXTARGETS);
                 exit(1);
             }
-            target_addr_override = converted.s_addr;
-            DPRINT ("Outgoing target IP set to %s\n", argv[i]);
+            targetOverrides[targetOverridesNum] = parsed;
+            targetOverridesNum++;
+            if (parsed.ifaceName) {
+                DPRINT ("Outgoing target IP for %s set to %s\n", parsed.ifaceName, inet_ntoa(parsed.addr));
+            } else {
+                DPRINT ("Outgoing target IP set to %s\n", inet_ntoa(parsed.addr));
+            }
         }
         else if (strcmp(argv[i],"--id") == 0) {
             i++;
@@ -217,6 +330,7 @@ int main(int argc,char **argv) {
     int maxifs = 0;
     for (int i = 0; i < interfaceNamesNum; i++) {
         struct Iface* iface = &ifs[maxifs];
+        iface->name = interfaceNames[i];
 
         struct ifreq basereq;
         strncpy(basereq.ifr_name,interfaceNames[i],IFNAMSIZ);
@@ -225,7 +339,7 @@ int main(int argc,char **argv) {
         {
             #ifdef ___APPLE__
                 /*
-                TODO: Supposedly this works for all OS, including non-Apple, 
+                TODO: Supposedly this works for all OS, including non-Apple,
                 and could replace the code below
                 */
                 iface->ifindex = if_nametoindex(interfaceNames[i]);
@@ -554,64 +668,54 @@ int main(int argc,char **argv) {
                 fromPort = origFromPort;
             }
 
-            struct in_addr toAddress;
-            if (target_addr_override) {
-                // user instructed us to override the target IP address
-                if (target_addr_override == INADDR_BROADCAST) {
-                    // rewrite to new interface broadcast addr if user specified 255.255.255.255
-                    toAddress = iface->dstaddr;
-                } else {
-                    // else rewrite to specified value
-                    toAddress.s_addr = target_addr_override;
+            // resolve where to send this packet (based on -t option(s) used)
+            struct in_addr toAddresses[MAXTARGETS];
+            const size_t toAddressesNum = resolve_to_addresses(rcv_inaddr, fromIface, iface,
+                toAddresses, MAXTARGETS);
+
+            for (size_t iTo = 0; iTo < toAddressesNum; iTo++) {
+                const struct in_addr toAddress = toAddresses[iTo];
+                u_short toPort = origToPort;
+
+                char fromAddressStr[255];
+                inet_ntoa2(fromAddress, fromAddressStr, sizeof(fromAddressStr));
+                char toAddressStr[255];
+                inet_ntoa2(toAddress, toAddressStr, sizeof(toAddressStr));
+                DPRINT (
+                    "-> [ %s:%d -> %s:%d (iface=%d)\n",
+                    fromAddressStr, fromPort,
+                    toAddressStr, toPort,
+                    iface->ifindex
+                );
+
+                /* Send the packet */
+                gram[8] = ttl;
+                memcpy(gram+12, &fromAddress.s_addr, 4);
+                memcpy(gram+16, &toAddress.s_addr, 4);
+                *(u_short*)(gram+20)=htons(fromPort);
+                *(u_short*)(gram+22)=htons(toPort);
+                #if (defined __FreeBSD__ && __FreeBSD__ <= 10) || defined __APPLE__
+                *(u_short*)(gram+24)=htons(UDPHEADER_LEN + len);
+                *(u_short*)(gram+2)=HEADER_LEN + len;
+                #else
+                *(u_short*)(gram+24)=htons(UDPHEADER_LEN + len);
+                *(u_short*)(gram+2)=htons(HEADER_LEN + len);
+                #endif
+                struct sockaddr_in sendAddr;
+                sendAddr.sin_family = AF_INET;
+                sendAddr.sin_port = htons(toPort);
+                sendAddr.sin_addr = toAddress;
+
+                if (sendto(
+                    iface->raw_socket,
+                    &gram,
+                    HEADER_LEN+len,
+                    0,
+                    (struct sockaddr*)&sendAddr,
+                    sizeof(sendAddr)
+                ) < 0) {
+                    perror("sendto");
                 }
-            } else if (rcv_inaddr.s_addr == INADDR_BROADCAST
-                || rcv_inaddr.s_addr == fromIface->dstaddr.s_addr) {
-                // Received on interface broadcast address -- rewrite to new interface broadcast addr
-                toAddress = iface->dstaddr;
-            } else {
-                // Send to whatever IP it was originally to
-                toAddress = rcv_inaddr;
-            }
-            u_short toPort = origToPort;
-
-            char fromAddressStr[255];
-            inet_ntoa2(fromAddress, fromAddressStr, sizeof(fromAddressStr));
-            char toAddressStr[255];
-            inet_ntoa2(toAddress, toAddressStr, sizeof(toAddressStr));
-            DPRINT (
-                "-> [ %s:%d -> %s:%d (iface=%d)\n",
-                fromAddressStr, fromPort,
-                toAddressStr, toPort,
-                iface->ifindex
-            );
-
-            /* Send the packet */
-            gram[8] = ttl;
-            memcpy(gram+12, &fromAddress.s_addr, 4);
-            memcpy(gram+16, &toAddress.s_addr, 4);
-            *(u_short*)(gram+20)=htons(fromPort);
-            *(u_short*)(gram+22)=htons(toPort);
-            #if (defined __FreeBSD__ && __FreeBSD__ <= 10) || defined __APPLE__
-            *(u_short*)(gram+24)=htons(UDPHEADER_LEN + len);
-            *(u_short*)(gram+2)=HEADER_LEN + len;
-            #else
-            *(u_short*)(gram+24)=htons(UDPHEADER_LEN + len);
-            *(u_short*)(gram+2)=htons(HEADER_LEN + len);
-            #endif
-            struct sockaddr_in sendAddr;
-            sendAddr.sin_family = AF_INET;
-            sendAddr.sin_port = htons(toPort);
-            sendAddr.sin_addr = toAddress;
-
-            if (sendto(
-                iface->raw_socket,
-                &gram,
-                HEADER_LEN+len,
-                0,
-                (struct sockaddr*)&sendAddr,
-                sizeof(sendAddr)
-            ) < 0) {
-                perror("sendto");
             }
         }
         DPRINT ("\n");
