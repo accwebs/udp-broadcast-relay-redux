@@ -36,7 +36,7 @@ USAGE
     [--dev eth1...] \
     [--multicast 224.0.0.251] \
     [-s <spoof_source_ip>] \
-    [-t <overridden_target_ip>]
+    [-t [<iface>:]<overridden_target_ip>]
 ```
 
 - udp-broadcast-relay-redux must be run as root to be able to create a raw
@@ -52,6 +52,13 @@ USAGE
   to the address of the outgoing interface.
 - A special destination ip of `-t 255.255.255.255` can be used to set the
   overriden target ip to the broadcast address of the outgoing interface.
+- `-t` can be repeated, and each one can optionally be qualified to a single
+  outgoing interface with `-t <iface>:<ip>` (`<iface>` matching a name passed
+  to `--dev`). Qualified entries for an interface fully replace the plain
+  `-t` fallback (and default resolution) for that interface only; giving the
+  same interface with multiple qualified `-t` arguments sends a separate copy 
+  to each address. A plain `-t <ip>` with no `iface:` prefix still applies to
+  any interface that has no qualified entry of its own, same as before.
 - `-f` will fork the application to the background.
 
 EXAMPLE
@@ -88,6 +95,18 @@ Router 1 (source):
 Router 2 (target):
 
 `./udp-broadcast-relay-redux --id 2 --port 6112 --dev br-lan --dev tun0 -t 255.255.255.255`
+
+#### Relaying broadcasts to multiple tun-based VPN peers from one hub
+When several remote sites share one tun device (e.g. an OpenVPN server with
+multiple clients), qualify `-t` with the interface name so each peer gets its
+own unicast copy, while a plain `-t 255.255.255.255` still handles the LAN
+side's real broadcast address:
+
+`./udp-broadcast-relay-redux --id 1 --port 6112 --dev br-lan --dev tun0 -t 255.255.255.255 -t tun0:10.66.2.13 -t tun0:10.66.2.14`
+
+(where 10.66.2.13 and 10.66.2.14 are two remote sites' IPs over the shared
+tun0 link; `br-lan` has no qualified entry, so it falls back to the plain
+`-t 255.255.255.255` and uses its own broadcast address)
 
 #### HDHomerun Discovery
 `./udp-broadcast-relay-redux --id 1 --port 65001 --dev eth0 --dev eth1`
